@@ -40,6 +40,7 @@ LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 AuxLossStruct = base_layer.AuxLossStruct
 
 AUX_LOSS = base_layer.AUX_LOSS
+sub_config_field = base_layer.sub_config_field
 template_field = base_layer.template_field
 
 
@@ -231,6 +232,8 @@ class TransformerLm(base_layer.BaseLayer):
   position_emb_tpl: LayerTpl = template_field(
       embedding_softmax.PositionalEmbedding
   )
+  embeddings_ln_tpl: LayerTpl = template_field(
+      normalizations.LayerNorm)
   model_dims: int = 0
   stacked_transformer_tpl: LayerTpl = template_field(
       transformers.StackedTransformer
@@ -437,7 +440,12 @@ class TransformerLm(base_layer.BaseLayer):
 
   def setup(self) -> None:
     """Constructor."""
-
+    
+    # Optional post-embedding layernorm
+    if self.embeddings_ln_tpl is not None:
+      ln_params = self.embeddings_ln_tpl.clone().set(dim=self.model_dims)
+      self.create_child('embeddings_ln', ln_params)
+      
     # Optional positional embedding layer.
     if self.position_emb_tpl is not None:
       pos_params = self.position_emb_tpl.clone()
@@ -617,6 +625,10 @@ class TransformerLm(base_layer.BaseLayer):
       inputs = input_emb + position_emb
     else:
       inputs = input_emb
+      
+    if self.embeddings_ln_tpl is not None:
+      inputs = self.embeddings_ln(inputs)
+      
     return inputs
 
   def __call__(self,
@@ -1488,14 +1500,11 @@ class TransformerEncoderDecoder(base_layer.BaseLayer):
     """
     if labels is None:
       logits = self.softmax.get_logits(inputs=activations)
-      xent_output = NestedMap(logits=logits)
-      # For numerical stability, use fp32 for softmax and log_softmax.
-      logits_dtype = logits.dtype
-      casted_logits = logits.astype(jnp.float32)
-      xent_output.log_probs = jax.nn.log_softmax(casted_logits).astype(
-          logits_dtype)
-      xent_output.probs = jax.nn.softmax(casted_logits).astype(logits_dtype)
-      return xent_output
+      return NestedMap(
+          logits=logits,
+          log_probs=jax.nn.log_softmax(logits),
+          probs=jax.nn.softmax(logits),
+      )
     class_ids = None
     class_probabilities = None
     if 'class_ids' in labels:

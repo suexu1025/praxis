@@ -18,7 +18,7 @@
 import functools
 import math
 import string
-from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple, Union, Any
+from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 from absl import logging
 from flax import linen as nn
@@ -31,13 +31,13 @@ from praxis import base_layer
 from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import pytypes
-from praxis.layers import base_ops
 from praxis.layers import embedding_softmax
 from praxis.layers import stochastics
 
 NestedMap = py_utils.NestedMap
 WeightInit = base_layer.WeightInit
 WeightHParams = base_layer.WeightHParams
+sub_config_field = base_layer.sub_config_field
 template_field = base_layer.template_field
 LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 JTensor = pytypes.JTensor
@@ -580,7 +580,7 @@ class AttentionProjection(base_layer.BaseLayer):
   attention_combine_dims: bool = False
   use_nhd_shape: bool = False
   explicit_fan_in_fan_out_axes: bool = False  # TODO(b/232864754) switch to True
-  einsum_tpl: LayerTpl = template_field(base_ops.Einsum)
+  make_dot_general_tpl: LayerTpl = template_field(base_layer.MakeDotGeneral)
 
   def setup(self) -> None:
     wp = self.weight_split_dims_mapping
@@ -661,7 +661,7 @@ class AttentionProjection(base_layer.BaseLayer):
         )
       self.create_variable('b', pc_bias)
 
-    self.create_child('einsum', self.einsum_tpl.clone())
+    self.create_child('make_dot_general', self.make_dot_general_tpl.clone())
 
   def __call__(self, inputs: JTensor) -> JTensor:
     """Computes the multi headed projection for inputs.
@@ -704,7 +704,7 @@ class AttentionProjection(base_layer.BaseLayer):
       ), f'Expecting shape[-1] == p.input_dim, {shape[-1]} != {self.input_dim}'
       batch_eqn = eqn_sym[:(rank - 1)] if rank else '...'
       eqn = f'{batch_eqn}D,DNH->{batch_eqn}NH'
-    ret = self.einsum(eqn, inputs, w)
+    ret = jnp.einsum(eqn, inputs, w, _dot_general=self.make_dot_general())
     if self.use_bias:
       ret += theta.b
     return ret
@@ -740,7 +740,7 @@ class CombinedQKVProjectionLayer(base_layer.BaseLayer):
   use_bias: bool = True
   attention_combine_dims: bool = False
   explicit_fan_in_fan_out_axes: bool = False  # TODO(b/232864754) switch to True
-  einsum_tpl: LayerTpl = template_field(base_ops.Einsum)
+  make_dot_general_tpl: LayerTpl = template_field(base_layer.MakeDotGeneral)
 
   def setup(self) -> None:
     # Sharding has the same convention of AttentionProjection, which doesn't
@@ -802,7 +802,8 @@ class CombinedQKVProjectionLayer(base_layer.BaseLayer):
           tensor_split_dims_mapping=bias_split_dims_mapping,
       )
       self.create_variable('b', pc_bias)
-    self.create_child('einsum', self.einsum_tpl.clone())
+
+    self.create_child('make_dot_general', self.make_dot_general_tpl.clone())
 
   # TODO(zhangqiaorjc): Take query, key, value as inputs to support all
   # attentions.
@@ -840,7 +841,7 @@ class CombinedQKVProjectionLayer(base_layer.BaseLayer):
 
     # K indexes qkv.
     eqn = f'{batch_eqn}D,KDNH->K{batch_eqn}NH'
-    ret = self.einsum(eqn, inputs, w)
+    ret = jnp.einsum(eqn, inputs, w, _dot_general=self.make_dot_general())
     ret = checkpoint_name(ret, 'combined_qkv_proj')
     if self.use_bias:
       # Add newaxis to bias weight for each batch dim since ret is K...NH
@@ -964,6 +965,7 @@ class DotProductAttention(base_layer.BaseLayer):
   internal_enable_per_dim_scale: bool = True
   scale_logits_by_head_dims: bool = False
   atten_logit_cap: float = 0.0
+  use_alibi_emb: bool = False
   # TODO(pax-dev): merge use_rotary_position_emb and rotary_position_emb_tpl
   # by initializing rotary_position_emb_tpl = None.
   use_rotary_position_emb: bool = False
@@ -977,8 +979,8 @@ class DotProductAttention(base_layer.BaseLayer):
   decode_cache: bool = True
   attention_mask_summary: bool = False
   zero_fully_masked: bool = False
-  qk_einsum_tpl: LayerTpl = template_field(base_ops.Einsum)
-  pv_einsum_tpl: LayerTpl = template_field(base_ops.Einsum)
+  make_qk_dot_general_tpl: LayerTpl = template_field(base_layer.MakeDotGeneral)
+  make_pv_dot_general_tpl: LayerTpl = template_field(base_layer.MakeDotGeneral)
 
   # SPMD partition related params.
   #
@@ -1101,7 +1103,14 @@ class DotProductAttention(base_layer.BaseLayer):
       relative_bias_p = self.relative_bias_tpl.clone()
       relative_bias_p.num_heads = self.num_heads
       self.create_child('relative_bias', relative_bias_p)
-
+    
+    if self.use_alibi_emb:
+      alibi_emb = pax_fiddle.Config(
+      embedding_softmax.ALliBiPositionalEmbedding,
+      n_head = self.num_heads,
+      )
+      self.create_child('alibi_emb', alibi_emb)
+      
     if self.dconv_qkv:
       causal_dconv_p = pax_fiddle.Config(
           CausalDepthwiseConv1D,
@@ -1150,8 +1159,12 @@ class DotProductAttention(base_layer.BaseLayer):
       post_proj_p.weight_split_dims_mapping.wt = wp.proj
 
     self.create_child('post', post_proj_p)
-    self.create_child('qk_einsum', self.qk_einsum_tpl.clone())
-    self.create_child('pv_einsum', self.pv_einsum_tpl.clone())
+    self.create_child(
+        'make_qk_dot_general', self.make_qk_dot_general_tpl.clone()
+    )
+    self.create_child(
+        'make_pv_dot_general', self.make_pv_dot_general_tpl.clone()
+    )
 
   def _shard_bnh(self, x: JTensor) -> JTensor:
     """Shards tensors of shape [b, n, h].
@@ -1217,7 +1230,7 @@ class DotProductAttention(base_layer.BaseLayer):
   def _log_softmax_with_extra_logit(self, logits: JTensor) -> JTensor:
     """Computes log softmax with extra logit.
 
-    self.attention_extra_logit is a user defined float value that
+    self.hparams.attention_extra_logit is a user defined float value that
     helps to stabilize logit values so that they don't drift too much from it.
 
     Args:
@@ -1240,7 +1253,9 @@ class DotProductAttention(base_layer.BaseLayer):
 
   def _atten_logits(self, query: JTensor, key: JTensor) -> JTensor:
     """Compute logits from query and key."""
-    logits = self.qk_einsum('BTNH,BSNH->BNTS', query, key)
+    logits = jnp.einsum(
+        'BTNH,BSNH->BNTS', query, key, _dot_general=self.make_qk_dot_general()
+    )
     return logits
 
   def _dot_atten(
@@ -1288,7 +1303,7 @@ class DotProductAttention(base_layer.BaseLayer):
     logits = self._atten_logits(query, key)
     if relative_bias is not None:
       # The relative_bias has shape [1, n, t, s] or [b, n, t, s].
-      base_layer.assert_has_shape(relative_bias, [-1, n, t, s])
+      base_layer.assert_has_shape(relative_bias, [-1, n, -1, s])
       logits += relative_bias
     logits = checkpoint_name(logits, 'logits')
 
@@ -1319,7 +1334,9 @@ class DotProductAttention(base_layer.BaseLayer):
     # Apply attention dropout.
     probs = self.atten_dropout(probs)
     # Compute the attention context.
-    encoded = self.pv_einsum('BNTS,BSNH->BTNH', probs, value)
+    encoded = jnp.einsum(
+        'BNTS,BSNH->BTNH', probs, value, _dot_general=self.make_pv_dot_general()
+    )
 
     if self.zero_fully_masked:
       # Return zeros for tokens which don't attend anything.
@@ -1385,7 +1402,12 @@ class DotProductAttention(base_layer.BaseLayer):
     base_layer.assert_has_shape(atten_mask, [-1, 1, s])
     asserts.in_set(atten_mask.shape[0], [b, 1])
     query = self._scale_query(query)
-    logits = self.qk_einsum('BNH,BSNH->BNS', query, key)
+    logits = jnp.einsum(
+        'BNH,BSNH->BNS',
+        query,
+        key,
+        _dot_general=self.make_qk_dot_general(),
+    )
     if relative_bias is not None:
       base_layer.assert_has_shape(relative_bias, [-1, n, 1, s])
       asserts.in_set(relative_bias.shape[0], [b, 1])
@@ -1403,7 +1425,12 @@ class DotProductAttention(base_layer.BaseLayer):
       probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits)).astype(
           key.dtype)
     # Compute the attention context.
-    encoded = self.pv_einsum('BNS,BSNH->BNH', probs, value)
+    encoded = jnp.einsum(
+        'BNS,BSNH->BNH',
+        probs,
+        value,
+        _dot_general=self.make_pv_dot_general(),
+    )
 
     if self.zero_fully_masked:
       # Return zeros for tokens which don't attend anything.
@@ -1485,6 +1512,11 @@ class DotProductAttention(base_layer.BaseLayer):
     else:
       relative_bias = None
 
+    if self.use_alibi_emb:
+      relative_bias = self.alibi_emb(atten_mask)
+    else:
+      relative_bias = None
+      
     encoded, atten_probs = self._dot_atten(query_proj, key_proj, value_proj,
                                            atten_mask, relative_bias)
 
@@ -2890,110 +2922,22 @@ class LocalSelfAttention(DotProductAttention):
                           atten_mask: JTensor,
                           relative_bias: Optional[JTensor] = None,
                           time_step: Optional[JTensor] = None) -> JTensor:
-    if self.right_context > 0:
-      raise ValueError('Local attention must be causal to extend step.')
-
-    key = self._shard_blnh(self.get_decode_state(key_state_name))
-    value = self._shard_blnh(self.get_decode_state(value_state_name))
-    k_b = key.shape[0]
-    q_b = query.shape[0]
-    if q_b != k_b:
-      if q_b % k_b != 0:
-        raise ValueError(
-            f'q batch size {q_b} is not divisible by state batch size {k_b}')
-      key = jnp.repeat(key, q_b // k_b, axis=0)
-      value = jnp.repeat(value, q_b // k_b, axis=0)
-    if atten_mask.shape[0] != q_b and atten_mask.shape[0] != 1:
-      assert atten_mask.shape[0] == k_b, (atten_mask.shape, k_b)
-      atten_mask = jnp.repeat(atten_mask, q_b // k_b, axis=0)
-    # query is 3d.
-    query = self._shard_bnh(query)
-
-    def context_slice(
-        x: JTensor,
-        axis: int,
-        padding_value: Any,
-        time_step: JTensor,
-        slice_size: int,
-    ) -> JTensor:
-      """Returns a slice of x on the left of index `timestep` (inclusive).
-
-      If not enough elements, paddings will complete the slice.
-
-      Args:
-        x: Tensor to slice
-        axis: Axis to slice
-        padding_value: If the slice goes further left than x index 0, this value
-          will be used.
-        time_step: Index (inclusive) that finishes the slice.
-        slice_size: Size of the slice.
-
-      Returns:
-        Slice as a JTensor.
-      """
-      paddings_shape = list(x.shape)
-      paddings_shape[axis] = slice_size
-      paddings = jnp.full(paddings_shape, padding_value, dtype=x.dtype)
-
-      long_x = jnp.concatenate([paddings, x], axis=axis)
-      return jax.lax.dynamic_slice_in_dim(
-          long_x, time_step + 1, slice_size, axis=axis
-      )
-
-    key = context_slice(key, 1, 0.0, time_step, self.left_context)
-    value = context_slice(value, 1, 0.0, time_step, self.left_context)
-    atten_mask = context_slice(
-        atten_mask,
-        -1,
-        py_utils.get_large_negative_number(jnp.float32),
-        time_step,
-        self.left_context,
-    )
-
-    b, l, n, h = key.shape
-    base_layer.assert_has_shape(value, [b, l, n, h])
-    base_layer.assert_has_shape(query, [b, n, h])
-    base_layer.assert_has_shape(atten_mask, [-1, 1, l])
-    asserts.in_set(atten_mask.shape[0], [b, 1])
-    query = self._scale_query(query)
-    logits = self.qk_einsum('BNH,BLNH->BNL', query, key)
-    if relative_bias is not None:
-      relative_bias = context_slice(
-          relative_bias, -1, 0.0, time_step, self.left_context
-      )
-      base_layer.assert_has_shape(relative_bias, [-1, n, 1, l])
-      asserts.in_set(relative_bias.shape[0], [b, 1])
-      relative_bias = jnp.squeeze(relative_bias, axis=2)
-      logits += relative_bias
-    logits = self._cap_logits(logits)
-    # Attention softmax is always carried out in fp32.
-    logits = logits.astype(jnp.float32)
-    # Apply attention masking
-    padded_logits = logits + atten_mask.astype(jnp.float32)
-    # Of shape [b, n, s]
-    if self.attention_extra_logit is None:
-      probs = jax.nn.softmax(padded_logits, axis=-1).astype(key.dtype)
-    else:
-      probs = jnp.exp(self._log_softmax_with_extra_logit(padded_logits)).astype(
-          key.dtype)
-    # Compute the attention context.
-    encoded = self.pv_einsum('BNL,BLNH->BNH', probs, value)
-
-    if self.zero_fully_masked:
-      # Return zeros for tokens which don't attend anything.
-      fully_masked = jnp.all(
-          atten_mask < py_utils.get_large_negative_number(jnp.float32) / 2,
-          axis=-1,
-      )[..., jnp.newaxis]
-      encoded *= 1 - fully_masked
-
-    encoded = self._shard_bnh(encoded)
-    return encoded, probs  # pytype: disable=bad-return-type  # jax-ndarray
+    raise NotImplementedError('One step is not implemented for %s' %
+                              self.__name__)
 
   def init_states(self, target_batch_size: int,  # pytype: disable=signature-mismatch  # overriding-return-type-checks
                   target_max_length: int) -> NestedMap:
 
     raise NotImplementedError('init_states is not implemented for %s' %
+                              self.__name__)
+
+  def extend_step(self, query_vec: JTensor,  # pytype: disable=signature-mismatch  # overriding-parameter-name-checks
+                  *,
+                  atten_mask: JTensor,
+                  time_step: JTensor,
+                  segment_pos: Optional[JTensor],
+                  is_cross_attention: bool = False) -> JTensor:
+    raise NotImplementedError('extend_step is not implemented for %s' %
                               self.__name__)
 
 
@@ -3046,15 +2990,6 @@ class LocalSelfAttentionXL(LocalSelfAttention):
     # Keeps useful slices. [B, N, U, W, C]
     term_bd = term_bd[:, :, :, :w, :]
     return term_ac + term_bd
-
-  def extend_step(self, query_vec: JTensor,  # pytype: disable=signature-mismatch  # overriding-parameter-name-checks
-                  *,
-                  atten_mask: JTensor,
-                  time_step: JTensor,
-                  segment_pos: Optional[JTensor],
-                  is_cross_attention: bool = False) -> JTensor:
-    raise NotImplementedError('extend_step is not implemented for %s' %
-                              self.__name__)
 
 
 class CausalDepthwiseConv1D(base_layer.BaseLayer):

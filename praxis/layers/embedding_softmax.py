@@ -16,7 +16,7 @@
 """Embedding and softmax layers."""
 
 import math
-from typing import Optional, Union
+from typing import Optional, Union, Callable
 
 import jax
 from jax import numpy as jnp
@@ -26,7 +26,6 @@ from praxis import pax_fiddle
 from praxis import py_utils
 from praxis import pytypes
 from praxis.layers import activations
-from praxis.layers import base_ops
 from praxis.layers import linears
 
 NestedMap = py_utils.NestedMap
@@ -37,6 +36,7 @@ JTensor = pytypes.JTensor
 SplitDimsMapping = pytypes.SplitDimsMapping
 LayerTpl = pax_fiddle.Config[base_layer.BaseLayer]
 
+sub_config_field = base_layer.sub_config_field
 template_field = base_layer.template_field
 
 
@@ -63,13 +63,15 @@ class TokenCounter(base_layer.BaseLayer):
     # Do not allow bfloat16 conversion.
     approx_total_tokens_mm = WeightHParams(
         shape=(),
-        init=base_layer.WeightInit.Constant(0.),
+        init=base_layer.WeightInit.Constant(0.0),
         collections=[
             base_layer.WeightHParamsCollection.REQUIRES_SUM_SYNC,
-            base_layer.WeightHParamsCollection.DISALLOW_BFLOAT16_CONVERSION
-        ])
+            base_layer.WeightHParamsCollection.DISALLOW_BFLOAT16_CONVERSION,
+        ],
+    )
     self.create_variable(
-        'approx_total_tokens_mm', approx_total_tokens_mm, trainable=False)
+        'approx_total_tokens_mm', approx_total_tokens_mm, trainable=False
+    )
 
   def __call__(self, inputs: JTensor, paddings: JTensor) -> JTensor:
     """Track total non-padding tokens.
@@ -85,7 +87,8 @@ class TokenCounter(base_layer.BaseLayer):
       batch_total_mm = jnp.sum(1.0 - paddings).astype(jnp.float32) / scale
       # Force f32 addition.
       new_approx_total_tokens_mm = approx_total_tokens_mm.astype(
-          jnp.float32) + batch_total_mm.astype(jnp.float32)
+          jnp.float32
+      ) + batch_total_mm.astype(jnp.float32)
       self.update_var('approx_total_tokens_mm', new_approx_total_tokens_mm)  # pytype: disable=bad-return-type  # jax-ndarray
 
 
@@ -103,6 +106,7 @@ class Embedding(base_layer.BaseLayer):
     set_nan_for_oob_id: If set to True, embeddings corresponding to
       out-of-boundaries ids will be set to NaN. Useful for debugging purposes.
   """
+
   num_classes: int = 0
   input_dims: int = 0
   lookup_style: str = 'index'
@@ -115,6 +119,7 @@ class Embedding(base_layer.BaseLayer):
     Attributes:
       emb_out_split_dims_mapping: Sharding of the emb output.
     """
+
     emb_out_split_dims_mapping: SplitDimsMapping = None
 
   def setup(self) -> None:
@@ -185,13 +190,14 @@ class FullSoftmax(base_layer.BaseLayer):
     feed_forward_tpl: Sub configurable field for the feed-forward layer. If
       None, skip feedforward layer and directly apply softmax to the input.
   """
+
   input_dims: int = 0
   num_classes: int = 0
   soft_cap_logits: Optional[float] = 0.0
   bi_tempered_loss_tpl: Optional[LayerTpl] = template_field(None)
   label_smoothing_prob: float = 0.0
   label_smoothing_apply_for_eval: bool = True
-  z_loss_weight: float = 0.
+  z_loss_weight: float = 0.0
   bias_init: Optional[float] = 0.0
   feed_forward_tpl: LayerTpl = template_field(linears.FeedForward)
 
@@ -235,11 +241,13 @@ class FullSoftmax(base_layer.BaseLayer):
     """Converts logits to log probability scores."""
     return jax.nn.log_softmax(logits)
 
-  def __call__(self,
-               inputs: JTensor,
-               class_weights: JTensor,
-               class_ids: Optional[JTensor] = None,
-               class_probabilities: Optional[JTensor] = None) -> NestedMap:
+  def __call__(
+      self,
+      inputs: JTensor,
+      class_weights: JTensor,
+      class_ids: Optional[JTensor] = None,
+      class_probabilities: Optional[JTensor] = None,
+  ) -> NestedMap:
     # pyformat:disable
     """Computes logits, softmax cross entropy etc.
 
@@ -297,22 +305,26 @@ class FullSoftmax(base_layer.BaseLayer):
 
     if self.bi_tempered_loss_tpl is None:
       per_example_xent = -jnp.sum(
-          log_probs * class_probabilities, axis=-1, dtype=jnp.float32)
+          log_probs * class_probabilities, axis=-1, dtype=jnp.float32
+      )
     else:
       per_example_xent = self.bi_tempered_loss(logits, class_probabilities)
     per_example_argmax = jax.lax.stop_gradient(
-        jnp.argmax(logits.astype(jnp.float32), axis=-1))
+        jnp.argmax(logits.astype(jnp.float32), axis=-1)
+    )
 
     # Compute total softmax cross-entropy loss for the output tensor.
     total_xent = jnp.sum(
         jnp.expand_dims(per_example_xent, axis=-1) * class_weights,
-        dtype=jnp.float32)
+        dtype=jnp.float32,
+    )
     total_weight = jnp.sum(class_weights, dtype=jnp.float32)
 
     if self.z_loss_weight > 0.0:
-      z_loss = jnp.sum(
-          _compute_z_loss(logits) * class_weights,
-          dtype=jnp.float32) / total_weight
+      z_loss = (
+          jnp.sum(_compute_z_loss(logits) * class_weights, dtype=jnp.float32)
+          / total_weight
+      )
       z_loss *= self.z_loss_weight
       self.add_summary('aux_z_loss', z_loss)
       self.add_aux_loss('aux_z_loss', z_loss)
@@ -324,7 +336,8 @@ class FullSoftmax(base_layer.BaseLayer):
         per_example_xent=per_example_xent.astype(jnp.float32),
         total_xent=total_xent,
         total_weight=total_weight,
-        avg_xent=(total_xent / (total_weight + 1e-6)).astype(jnp.float32))
+        avg_xent=(total_xent / (total_weight + 1e-6)).astype(jnp.float32),
+    )
     if self.z_loss_weight > 0.0:
       output_nmap['z_loss'] = z_loss
     return output_nmap
@@ -338,13 +351,14 @@ class SharedEmbeddingSoftmax(FullSoftmax):
     scale_sqrt_depth: If set True, activations are scaled with
       sqrt(embedding_dim) in emb_lookup.
   """
+
   lookup_style: str = 'index'
   scale_sqrt_depth: bool = False
-  einsum_tpl: LayerTpl = template_field(base_ops.Einsum)
+  make_dot_general_tpl: LayerTpl = template_field(base_layer.MakeDotGeneral)
 
   def setup(self) -> None:
     super().setup()
-    self.create_child('einsum', self.einsum_tpl.clone())
+    self.create_child('make_dot_general', self.make_dot_general_tpl.clone())
 
   class ActivationSharding(base_layer.BaseLayer.ActivationSharding):
     """Represents how intermediate values should be partitioned across a mesh.
@@ -352,6 +366,7 @@ class SharedEmbeddingSoftmax(FullSoftmax):
     Attributes:
       emb_out_split_dims_mapping: Sharding of the emb output.
     """
+
     emb_out_split_dims_mapping: SplitDimsMapping = None
 
   def emb_lookup(self, ids: JTensor) -> JTensor:
@@ -364,7 +379,9 @@ class SharedEmbeddingSoftmax(FullSoftmax):
       one_hot_ids = jax.nn.one_hot(
           ids, self.num_classes, dtype=self.fprop_dtype
       )
-      embs = self.einsum('...y,yz->...z', one_hot_ids, emb_var)
+      embs = linears.project_last_dim(
+          one_hot_ids, emb_var, dot_general=self.make_dot_general()
+      )
     else:
       raise ValueError('Unknown lookup style.')
     # Scale with sqrt(embedding dims)
@@ -394,6 +411,7 @@ class SigmoidCrossEntropy(base_layer.BaseLayer):
     feed_forward_tpl: Sub configurable field for the feed-forward layer. If
       None, skip the FFN projection.
   """
+
   input_dims: int = 0
   num_classes: int = 0
   soft_cap_logits: Optional[float] = 0.0
@@ -439,11 +457,13 @@ class SigmoidCrossEntropy(base_layer.BaseLayer):
       logits = self.soft_cap_logits * jnp.tanh(logits / self.soft_cap_logits)
     return logits
 
-  def __call__(self,
-               inputs: JTensor,
-               class_weights: JTensor,
-               class_ids: Optional[JTensor] = None,
-               class_probabilities: Optional[JTensor] = None) -> NestedMap:
+  def __call__(
+      self,
+      inputs: JTensor,
+      class_weights: JTensor,
+      class_ids: Optional[JTensor] = None,
+      class_probabilities: Optional[JTensor] = None,
+  ) -> NestedMap:
     """Computes logits, sigmoid cross entropy etc.
 
     Args:
@@ -482,7 +502,8 @@ class SigmoidCrossEntropy(base_layer.BaseLayer):
       if self.num_classes == 1:
         raise ValueError(
             'one_hot with num_classes=1 has a strange behavior. Please double '
-            'check this is what you intended to do.')
+            'check this is what you intended to do.'
+        )
       class_probabilities = jax.nn.one_hot(
           jnp.squeeze(class_ids, axis=-1), self.num_classes, dtype=jnp.float32
       )
@@ -510,18 +531,23 @@ class SigmoidCrossEntropy(base_layer.BaseLayer):
     relu_logits = jnp.where(cond, logits, zeros)
     neg_abs_logits = jnp.where(cond, -logits, logits)
     per_class_xent = (
-        relu_logits - logits * class_probabilities +
-        jnp.log1p(jnp.exp(neg_abs_logits)))
+        relu_logits
+        - logits * class_probabilities
+        + jnp.log1p(jnp.exp(neg_abs_logits))
+    )
     per_example_xent = jnp.sum(
-        per_class_xent * per_class_weight, axis=-1, dtype=jnp.float32)
+        per_class_xent * per_class_weight, axis=-1, dtype=jnp.float32
+    )
 
     per_example_argmax = jax.lax.stop_gradient(
-        jnp.argmax(logits.astype(jnp.float32), axis=-1))
+        jnp.argmax(logits.astype(jnp.float32), axis=-1)
+    )
 
     # Compute total sigmoid cross-entropy loss for the output tensor.
     total_xent = jnp.sum(
         jnp.expand_dims(per_example_xent, axis=-1) * per_example_weight,
-        dtype=jnp.float32)
+        dtype=jnp.float32,
+    )
 
     total_weight = jnp.sum(class_weights, dtype=jnp.float32)
     output_nmap = NestedMap(
@@ -531,7 +557,8 @@ class SigmoidCrossEntropy(base_layer.BaseLayer):
         per_example_xent=per_example_xent.astype(inputs_dtype),
         total_xent=total_xent.astype(inputs_dtype),
         total_weight=total_weight,
-        avg_xent=(total_xent / (total_weight + 1e-6)).astype(inputs_dtype))
+        avg_xent=(total_xent / (total_weight + 1e-6)).astype(inputs_dtype),
+    )
     return output_nmap
 
 
@@ -550,19 +577,20 @@ class GShardSharedEmbeddingSoftmax(base_layer.BaseLayer):
     num_classes: Total number of target classes.
     use_tgt_labels_size_as_loss_denominator: False to use total number of
       non-padding tokens instead of fixed tgt_labels tensor size.
-    soft_cap_logits: If not None logits are soft capped to this value before
-      the absolute value clipping with p.logits_abs_max.
+    soft_cap_logits: If not None logits are soft capped to this value before the
+      absolute value clipping with p.logits_abs_max.
     logits_abs_max: Absolute logits clipping.
     z_loss_weight: If z_loss_weight is nonzero, we add a loss equal to
       z_loss_weight * square(logsumexp(logits, -1))
     label_smoothing_prob: Optional label smoothing.
   """
+
   input_dims: int = 0
   num_classes: int = 0
   use_tgt_labels_size_as_loss_denominator: bool = True
   soft_cap_logits: Optional[float] = 0.0
   logits_abs_max: Optional[float] = 0.0
-  z_loss_weight: float = 0.
+  z_loss_weight: float = 0.0
   label_smoothing_prob: float = 0.0
 
   class ActivationSharding(base_layer.BaseLayer.ActivationSharding):
@@ -571,6 +599,7 @@ class GShardSharedEmbeddingSoftmax(base_layer.BaseLayer):
     Attributes:
       emb_out_split_dims_mapping: Mesh split for embedding outputs..
     """
+
     emb_out_split_dims_mapping: SplitDimsMapping = None
 
   def setup(self) -> None:
@@ -629,11 +658,13 @@ class GShardSharedEmbeddingSoftmax(base_layer.BaseLayer):
       logits = jnp.clip(logits, -self.logits_abs_max, self.logits_abs_max)
     return logits
 
-  def __call__(self,
-               inputs: JTensor,
-               class_weights: JTensor,
-               class_ids: Optional[JTensor] = None,
-               class_probabilities: Optional[JTensor] = None) -> NestedMap:
+  def __call__(
+      self,
+      inputs: JTensor,
+      class_weights: JTensor,
+      class_ids: Optional[JTensor] = None,
+      class_probabilities: Optional[JTensor] = None,
+  ) -> NestedMap:
     """Computes logits, cross entropy etc.
 
     Args:
@@ -679,31 +710,36 @@ class GShardSharedEmbeddingSoftmax(base_layer.BaseLayer):
       class_probabilities_prior_to_label_smoothing = class_probabilities
       off_value = self.label_smoothing_prob / self.num_classes
       on_value = 1.0 - self.label_smoothing_prob + off_value
-      class_probabilities = (on_value * class_probabilities + off_value *
-                             (1.0 - class_probabilities)).astype(jnp.float32)
+      class_probabilities = (
+          on_value * class_probabilities
+          + off_value * (1.0 - class_probabilities)
+      ).astype(jnp.float32)
     class_probabilities = jax.lax.stop_gradient(class_probabilities)
 
     per_example_xent = -jnp.sum(
-        log_probs * class_probabilities, axis=-1, dtype=jnp.float32)
+        log_probs * class_probabilities, axis=-1, dtype=jnp.float32
+    )
 
     per_example_argmax = jax.lax.stop_gradient(
-        jnp.argmax(logits.astype(jnp.float32), axis=-1))
+        jnp.argmax(logits.astype(jnp.float32), axis=-1)
+    )
 
     # Compute total softmax for the entire sequence
     total_xent = jnp.sum(
         jnp.expand_dims(per_example_xent, axis=-1) * class_weights,
-        dtype=jnp.float32)
+        dtype=jnp.float32,
+    )
 
     total_weight = jnp.sum(class_weights, dtype=jnp.float32)
 
     if self.use_tgt_labels_size_as_loss_denominator:
       loss_denominator = jnp.sum(
-          jnp.ones_like(class_weights), dtype=jnp.float32)
+          jnp.ones_like(class_weights), dtype=jnp.float32
+      )
     else:
       loss_denominator = total_weight
     avg_xent = (total_xent / loss_denominator).astype(jnp.float32)
-    z_loss = (
-        jnp.sum(_compute_z_loss(logits) * class_weights) / loss_denominator)
+    z_loss = jnp.sum(_compute_z_loss(logits) * class_weights) / loss_denominator
     z_loss *= self.z_loss_weight
     self.add_summary('aux_z_loss', z_loss)
     self.add_aux_loss('aux_z_loss', z_loss)
@@ -712,16 +748,19 @@ class GShardSharedEmbeddingSoftmax(base_layer.BaseLayer):
       per_example_xent_prior_to_label_smoothing = -jnp.sum(
           log_probs * class_probabilities_prior_to_label_smoothing,
           axis=-1,
-          dtype=jnp.float32)
+          dtype=jnp.float32,
+      )
       total_xent_prior_to_label_smoothing = jnp.sum(
-          jnp.expand_dims(
-              per_example_xent_prior_to_label_smoothing,
-              axis=-1) * class_weights, dtype=jnp.float32)
+          jnp.expand_dims(per_example_xent_prior_to_label_smoothing, axis=-1)
+          * class_weights,
+          dtype=jnp.float32,
+      )
       avg_xent_prior_to_label_smoothing = (
-          total_xent_prior_to_label_smoothing /
-          loss_denominator).astype(inputs_dtype)
-      self.add_summary('avg_xent_prior_to_label_smoothing',
-                       avg_xent_prior_to_label_smoothing)
+          total_xent_prior_to_label_smoothing / loss_denominator
+      ).astype(inputs_dtype)
+      self.add_summary(
+          'avg_xent_prior_to_label_smoothing', avg_xent_prior_to_label_smoothing
+      )
 
     output_nmap = NestedMap(
         logits=logits.astype(inputs_dtype),
@@ -734,7 +773,8 @@ class GShardSharedEmbeddingSoftmax(base_layer.BaseLayer):
         # EncoderDecoder model we will have to adjust weighting as well.
         avg_xent_weight=loss_denominator,
         avg_xent=avg_xent,
-        total_weight=total_weight)
+        total_weight=total_weight,
+    )
 
     return output_nmap
 
@@ -753,13 +793,14 @@ class PositionalEmbedding(base_layer.BaseLayer):
       added signal.
     embedding_dims: Dimension of the embedding to be generated.
   """
+
   min_timescale: int = 1
   max_timescale: int = 10_000
   embedding_dims: int = 0
 
-  def __call__(self,
-               seq_length: Optional[int] = None,
-               position: Optional[JTensor] = None) -> JTensor:
+  def __call__(
+      self, seq_length: Optional[int] = None, position: Optional[JTensor] = None
+  ) -> JTensor:
     """Generates a JTensor of sinusoids with different frequencies.
 
     Args:
@@ -786,11 +827,12 @@ class PositionalEmbedding(base_layer.BaseLayer):
         jnp.arange(num_timescales, dtype=jnp.float32) * -log_timescale_increment
     )
     scaled_time = (
-        position[:, :, jnp.newaxis] *
-        inv_timescales[jnp.newaxis, jnp.newaxis, :])
+        position[:, :, jnp.newaxis]
+        * inv_timescales[jnp.newaxis, jnp.newaxis, :]
+    )
     signal = jnp.concatenate(
-        [jnp.sin(scaled_time), jnp.cos(scaled_time)],
-        axis=2).astype(self.fprop_dtype)
+        [jnp.sin(scaled_time), jnp.cos(scaled_time)], axis=2
+    ).astype(self.fprop_dtype)
     # Force usage of `np` rather than `jnp` to compute static values at trace
     # time.
     signal = jnp.pad(
@@ -821,17 +863,16 @@ class PositionalEmbedding2D(base_layer.BaseLayer):
   num_prepend_cls_tokens: int = 0
   num_append_cls_tokens: int = 0
 
-  def _compute_1d_embeddings(self,
-                             position: JTensor,
-                             hidden_dim: int,
-                             dtype: jnp.dtype = jnp.float32):
+  def _compute_1d_embeddings(
+      self, position: JTensor, hidden_dim: int, dtype: jnp.dtype = jnp.float32
+  ):
     position = position.astype(dtype)
     half_hid = hidden_dim // 2
     freq_seq = jnp.arange(half_hid, dtype=dtype)
     # the base 10000 is from the original sinusoidal positional embedding
     # formulation introduced in "attention is all you need" section 3.5.
     # https://arxiv.org/pdf/1706.03762.pdf
-    inv_freq = 1 / (10000**(freq_seq/half_hid))
+    inv_freq = 1 / (10000 ** (freq_seq / half_hid))
     positions = jnp.einsum('S,D->SD', position, inv_freq)
     sin = jnp.sin(positions)
     cos = jnp.cos(positions)
@@ -841,10 +882,8 @@ class PositionalEmbedding2D(base_layer.BaseLayer):
     dim = self.embedding_dims
     h_seq = jnp.arange(-self.h / 2, self.h / 2)
     w_seq = jnp.arange(-self.w / 2, self.w / 2)
-    pos_emb_h = self._compute_1d_embeddings(
-        h_seq, dim // 2, dtype=jnp.float32)
-    pos_emb_w = self._compute_1d_embeddings(
-        w_seq, dim // 2, dtype=jnp.float32)
+    pos_emb_h = self._compute_1d_embeddings(h_seq, dim // 2, dtype=jnp.float32)
+    pos_emb_w = self._compute_1d_embeddings(w_seq, dim // 2, dtype=jnp.float32)
     pos_emb_2d = jnp.concatenate(
         [
             jnp.tile(pos_emb_h[:, None, :], [1, self.w, 1]),
@@ -854,9 +893,9 @@ class PositionalEmbedding2D(base_layer.BaseLayer):
     )
     return pos_emb_2d
 
-  def __call__(self,
-               seq_length: Optional[int] = None,
-               position: Optional[JTensor] = None) -> JTensor:
+  def __call__(
+      self, seq_length: Optional[int] = None, position: Optional[JTensor] = None
+  ) -> JTensor:
     """Generates a JTensor of sinusoids with different frequencies.
 
     Args:
@@ -890,15 +929,79 @@ class PositionalEmbedding2D(base_layer.BaseLayer):
     return pos_emb
 
 
+class ALliBiPositionalEmbedding(base_layer.BaseLayer):
+  """Generates position embedding for a given 1-d sequence."""
+  n_head: int = True
+
+  def setup(self) -> None:
+    if self.n_head == 0:
+      raise ValueError(
+          'Embedding dim for rotary position embedding must be larger than 0.'
+      )
+    super().setup()
+    
+  def __call__(self, attention_mask: JTensor) -> JTensor:
+    """Generates a JTensor from  attention mask and number of head
+
+    Args:
+      attention_mask:   [B, key_length]
+
+    Returns:
+      (B, num_heads, query_length=1, key_length)
+    """
+
+    assert attention_mask.ndim == 4, attention_mask.shape
+
+    batch_size, dim1, query_length, key_length = attention_mask.shape
+    print(attention_mask.shape)
+    assert dim1 == 1
+    
+    num_heads = self.n_head
+    #query_length = 1
+
+    def get_slopes(n):
+      def get_slopes_power_of_2(n):
+        start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+        ratio = start
+        return [start * ratio**i for i in range(n)]
+
+      if math.log2(n).is_integer():
+        return get_slopes_power_of_2(n)
+      else:
+        closest_power_of_2 = 2 ** math.floor(math.log2(n))
+        return (
+            get_slopes_power_of_2(closest_power_of_2)
+            + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+        )
+
+    slopes = jnp.array(get_slopes(num_heads))[None, :, None, None].astype(
+        jnp.float32
+    )
+
+    arange_tensor = (
+        attention_mask.cumsum(-1, dtype=jnp.float32) - 1
+    )
+    slopes_broadcasted = jnp.broadcast_to(
+        slopes, (batch_size, num_heads, query_length, key_length)
+    )
+    arange_broadcasted = jnp.broadcast_to(
+        arange_tensor, (batch_size, num_heads, query_length, key_length)
+    )
+    alibi = slopes_broadcasted * arange_broadcasted
+
+    return alibi
+
+
 class RotaryPositionalEmbedding(PositionalEmbedding):
   """Applies rotary position embedding for a given 1-d sequence.
 
   The Rotary position embedding is described in https://arxiv.org/abs/2104.09864
 
   Attributes:
-    cast_as_fprop_dtype: If True, the returned vars are cast as fprop_dtype
-    to save some memory.
+    cast_as_fprop_dtype: If True, the returned vars are cast as fprop_dtype to
+      save some memory.
   """
+
   cast_as_fprop_dtype: bool = True
 
   def setup(self) -> None:
@@ -908,9 +1011,9 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
       )
     super().setup()
 
-  def __call__(self,
-               inputs: JTensor,
-               position: Optional[JTensor] = None) -> JTensor:
+  def __call__(
+      self, inputs: JTensor, position: Optional[JTensor] = None
+  ) -> JTensor:
     """Generates a JTensor of sinusoids with different frequencies.
 
     Args:
@@ -926,11 +1029,15 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
       the rotary position embedding incorporated in it.
     """
     if len(inputs.shape) != 4:
-      raise ValueError('Input is assumed to be a rank 4 tensor of shape'
-                       '[batch, sequence, heads, dims].')
+      raise ValueError(
+          'Input is assumed to be a rank 4 tensor of shape'
+          '[batch, sequence, heads, dims].'
+      )
     if self.embedding_dims != inputs.shape[3]:
-      raise ValueError('The embedding dims of the rotary position embedding'
-                       'must match the hidden dimension of the inputs.')
+      raise ValueError(
+          'The embedding dims of the rotary position embedding'
+          'must match the hidden dimension of the inputs.'
+      )
     half_embedding_dim = self.embedding_dims // 2
     fraction = 2 * jnp.arange(0, half_embedding_dim) / self.embedding_dims
     timescale = (
@@ -946,17 +1053,17 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
     sin = jnp.sin(sinusoid_inp)
     cos = jnp.cos(sinusoid_inp)
     first_half, second_half = jnp.split(inputs, 2, axis=-1)
-    first_part = (first_half * cos - second_half * sin)
-    second_part = (second_half * cos + first_half * sin)
+    first_part = first_half * cos - second_half * sin
+    second_part = second_half * cos + first_half * sin
     # TODO(b/252874053): Clean this up after phase 3 is done.
     if self.cast_as_fprop_dtype:
       first_part = first_part.astype(self.fprop_dtype)
       second_part = second_part.astype(self.fprop_dtype)
     return jnp.concatenate([first_part, second_part], axis=-1)
 
-  def extend_step(self,
-                  inputs: JTensor,
-                  position: Optional[Union[int, JTensor]] = None) -> JTensor:
+  def extend_step(
+      self, inputs: JTensor, position: Optional[Union[int, JTensor]] = None
+  ) -> JTensor:
     """Generates a JTensor of sinusoids with different frequencies for a step.
 
     Args:
@@ -985,9 +1092,9 @@ class RotaryPositionalEmbedding(PositionalEmbedding):
     position = jnp.broadcast_to(position, [inputs_shape[0]])[:, jnp.newaxis]
     # [B, P]
     prefix_position = position - jnp.flip(prefix_position)[jnp.newaxis, :]
-    prefix_position = jnp.where(prefix_position < 0,
-                                jnp.zeros_like(prefix_position),
-                                prefix_position)
+    prefix_position = jnp.where(
+        prefix_position < 0, jnp.zeros_like(prefix_position), prefix_position
+    )
     output = self(inputs, position=prefix_position)
     if len(inputs_shape) == 3:
       output = jnp.squeeze(output, axis=1)
@@ -1001,6 +1108,7 @@ class TrainablePositionalEmbedding(PositionalEmbedding):
     max_seq_length: Max sequence length.
     lookup_style: Style of lookup, one of index or matmul.
   """
+
   max_seq_length: int = 10_240
   lookup_style: str = 'matmul'
 
@@ -1025,9 +1133,9 @@ class TrainablePositionalEmbedding(PositionalEmbedding):
         ),
     )
 
-  def __call__(self,
-               seq_length: Optional[int] = None,
-               position: Optional[JTensor] = None) -> JTensor:
+  def __call__(
+      self, seq_length: Optional[int] = None, position: Optional[JTensor] = None
+  ) -> JTensor:
     """Generates a JTensor of embedding lookup result.
 
     Args:
